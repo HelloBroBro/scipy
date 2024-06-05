@@ -4919,11 +4919,9 @@ def pearsonr(x, y, *, alternative='two-sided', method=None, axis=0):
 
     # As explained in the docstring, the distribution of `r` under the null
     # hypothesis is the beta distribution on (-1, 1) with a = b = n/2 - 1.
-    # This needs to be done with NumPy arrays given the existing infrastructure.
-    ab = n/2 - 1
-    dist = stats.beta(ab, ab, loc=-1, scale=2)
-    pvalue = _get_pvalue(np.asarray(r), dist, alternative, xp=np)
-    pvalue = xp.asarray(pvalue, dtype=dtype)
+    ab = xp.asarray(n/2 - 1)
+    dist = _SimpleBeta(ab, ab, loc=-1, scale=2)
+    pvalue = _get_pvalue(r, dist, alternative, xp=xp)
 
     r = r[()] if r.ndim == 0 else r
     pvalue = pvalue[()] if pvalue.ndim == 0 else pvalue
@@ -5542,7 +5540,8 @@ def spearmanr(a, b=None, axis=0, nan_policy='propagate',
         # errors before taking the square root
         t = rs * np.sqrt((dof/((rs+1.0)*(1.0-rs))).clip(0))
 
-    prob = _get_pvalue(t, distributions.t(dof), alternative, xp=np)
+    dist = _SimpleStudentT(dof)
+    prob = _get_pvalue(t, dist, alternative, xp=np)
 
     # For backwards compatibility, return scalars when comparing 2 columns
     if rs.shape == (2, 2):
@@ -6459,12 +6458,9 @@ def ttest_1samp(a, popmean, axis=0, nan_policy="propagate", alternative="two-sid
     with np.errstate(divide='ignore', invalid='ignore'):
         t = xp.divide(d, denom)
         t = t[()] if t.ndim == 0 else t
-    # This will only work for CPU backends for now. That's OK. In time,
-    # `from_dlpack` will enable the transfer from other devices, and
-    # `_get_pvalue` will even be reworked to support the native backend.
-    t_np = np.asarray(t)
-    prob = _get_pvalue(t_np, distributions.t(df), alternative, xp=np)
-    prob = xp.asarray(prob, dtype=t.dtype)
+
+    dist = _SimpleStudentT(xp.asarray(df, dtype=t.dtype))
+    prob = _get_pvalue(t, dist, alternative, xp=xp)
     prob = prob[()] if prob.ndim == 0 else prob
 
     # when nan_policy='omit', `df` can be different for different axis-slices
@@ -6474,7 +6470,7 @@ def ttest_1samp(a, popmean, axis=0, nan_policy="propagate", alternative="two-sid
     alternative_num = {"less": -1, "two-sided": 0, "greater": 1}[alternative]
     return TtestResult(t, prob, df=df, alternative=alternative_num,
                        standard_error=denom, estimate=mean,
-                       statistic_np=t_np, xp=xp)
+                       statistic_np=xp.asarray(t), xp=xp)
 
 
 def _t_confidence_interval(df, t, confidence_level, alternative, dtype=None, xp=None):
@@ -7326,38 +7322,8 @@ def ttest_rel(a, b, axis=0, nan_policy='propagate', alternative="two-sided"):
     TtestResult(statistic=-5.879467544540889, pvalue=7.540777129099917e-09, df=499)
 
     """
-    a, b, axis = _chk2_asarray(a, b, axis)
-
-    na = _get_len(a, axis, "first argument")
-    nb = _get_len(b, axis, "second argument")
-    if na != nb:
-        raise ValueError('unequal length arrays')
-
-    if na == 0 or nb == 0:
-        # _axis_nan_policy decorator ensures this only happens with 1d input
-        NaN = _get_nan(a, b)
-        return TtestResult(NaN, NaN, df=NaN, alternative=NaN,
-                           standard_error=NaN, estimate=NaN)
-
-    n = a.shape[axis]
-    df = n - 1
-
-    d = (a - b).astype(np.float64)
-    v = _var(d, axis, ddof=1)
-    dm = np.mean(d, axis)
-    denom = np.sqrt(v / n)
-
-    with np.errstate(divide='ignore', invalid='ignore'):
-        t = np.divide(dm, denom)[()]
-    prob = _get_pvalue(t, distributions.t(df), alternative, xp=np)
-
-    # when nan_policy='omit', `df` can be different for different axis-slices
-    df = np.broadcast_to(df, t.shape)[()]
-
-    # _axis_nan_policy decorator doesn't play well with strings
-    alternative_num = {"less": -1, "two-sided": 0, "greater": 1}[alternative]
-    return TtestResult(t, prob, df=df, alternative=alternative_num,
-                       standard_error=denom, estimate=dm)
+    return ttest_1samp(a - b, popmean=0, axis=axis, alternative=alternative,
+                       _no_deco=True)
 
 
 # Map from names to lambda_ values used in power_divergence().
@@ -9144,7 +9110,7 @@ def brunnermunzel(x, y, alternative="two-sided", distribution="t",
                        "(0/0). Try using `distribution='normal'")
             warnings.warn(message, RuntimeWarning, stacklevel=2)
 
-        distribution = distributions.t(df)
+        distribution = _SimpleStudentT(df)
     elif distribution == "normal":
         distribution = _SimpleNormal()
     else:
@@ -9289,9 +9255,9 @@ def combine_pvalues(pvalues, method='fisher', weights=None):
                            symmetric=False, xp=np)
     elif method == 'pearson':
         statistic = 2 * np.sum(np.log1p(-pvalues))
-        # _SimpleChi2 doesn't have `cdf` yet;
-        # add it when `combine_pvalues` is converted to array API
-        pval = distributions.chi2.cdf(-statistic, 2 * len(pvalues))
+        chi2 = _SimpleChi2(2 * len(pvalues))
+        pval = _get_pvalue(-statistic, chi2, alternative='less',
+                           symmetric=False, xp=np)
     elif method == 'mudholkar_george':
         normalizing_factor = np.sqrt(3/len(pvalues))/np.pi
         statistic = -np.sum(np.log(pvalues)) + np.sum(np.log1p(-pvalues))
@@ -9301,7 +9267,9 @@ def combine_pvalues(pvalues, method='fisher', weights=None):
                                   * approx_factor, nu)
     elif method == 'tippett':
         statistic = np.min(pvalues)
-        pval = distributions.beta.cdf(statistic, 1, len(pvalues))
+        beta = _SimpleBeta(1, len(pvalues))
+        pval = _get_pvalue(statistic, beta, alternative='less',
+                           symmetric=False, xp=np)
     elif method == 'stouffer':
         if weights is None:
             weights = np.ones_like(pvalues)
@@ -10893,7 +10861,10 @@ def linregress(x, y=None, alternative='two-sided'):
         # n-2 degrees of freedom because 2 has been used up
         # to estimate the mean and standard deviation
         t = r * np.sqrt(df / ((1.0 - r + TINY)*(1.0 + r + TINY)))
-        prob = _get_pvalue(t, distributions.t(df), alternative)
+
+        dist = _SimpleStudentT(df)
+        prob = _get_pvalue(t, dist, alternative, xp=np)
+        prob = prob[()] if prob.ndim == 0 else prob
 
         slope_stderr = np.sqrt((1 - r**2) * ssym / ssxm / df)
 
@@ -10928,5 +10899,47 @@ class _SimpleChi2:
     def __init__(self, df):
         self.df = df
 
+    def cdf(self, x):
+        return special.chdtr(self.df, x)
+
     def sf(self, x):
         return special.chdtrc(self.df, x)
+
+
+class _SimpleBeta:
+    # A very simple, array-API compatible beta distribution for use in
+    # hypothesis tests. May be replaced by new infrastructure beta
+    # distribution in due time.
+    def __init__(self, a, b, *, loc=None, scale=None):
+        self.a = a
+        self.b = b
+        self.loc = loc
+        self.scale = scale
+
+    def cdf(self, x):
+        if self.loc is not None or self.scale is not None:
+            loc = 0 if self.loc is None else self.loc
+            scale = 1 if self.scale is None else self.scale
+            return special.betainc(self.a, self.b, (x - loc)/scale)
+        return special.betainc(self.a, self.b, x)
+
+    def sf(self, x):
+        if self.loc is not None or self.scale is not None:
+            loc = 0 if self.loc is None else self.loc
+            scale = 1 if self.scale is None else self.scale
+            return special.betaincc(self.a, self.b, (x - loc)/scale)
+        return special.betaincc(self.a, self.b, x)
+
+
+class _SimpleStudentT:
+    # A very simple, array-API compatible t distribution for use in
+    # hypothesis tests. May be replaced by new infrastructure t
+    # distribution in due time.
+    def __init__(self, df):
+        self.df = df
+
+    def cdf(self, t):
+        return special.stdtr(self.df, t)
+
+    def sf(self, t):
+        return special.stdtr(self.df, -t)
